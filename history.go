@@ -106,7 +106,13 @@ func main() {
 	var portsLock sync.RWMutex
 
 	http.HandleFunc("/commit/", func(w http.ResponseWriter, r *http.Request) {
-		commit := r.URL.Path[len("/commit/"):]
+		parts := strings.SplitN(r.URL.Path[len("/commit/"):], "/", 2)
+		commit := parts[0]
+		var redirect string
+
+		if len(parts) == 2 {
+			redirect = parts[1]
+		}
 
 		if _, ok := commits[commit]; !ok {
 			http.NotFound(w, r)
@@ -163,7 +169,7 @@ func main() {
 
 		portsLock.RLock()
 		if port, ok := ports[commit]; ok {
-			http.Redirect(w, r, "http://localhost:"+port+"/", http.StatusSeeOther)
+			http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
 
 			portsLock.RUnlock()
 			return
@@ -173,7 +179,7 @@ func main() {
 
 		portsLock.Lock()
 		if port, ok := ports[commit]; ok {
-			http.Redirect(w, r, "http://localhost:"+port+"/", http.StatusSeeOther)
+			http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
 
 			portsLock.Unlock()
 			return
@@ -220,7 +226,7 @@ func main() {
 		}()
 		portsLock.Unlock()
 
-		http.Redirect(w, r, "http://localhost:"+port+"/", http.StatusSeeOther)
+		http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
 	})
 
 	fmt.Println("Listening on :8080")
