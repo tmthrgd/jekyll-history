@@ -27,6 +27,9 @@ func main() {
 	var timeout time.Duration
 	flag.DurationVar(&timeout, "timeout", 2*time.Minute, "how long to keep open the commit listeners before timing out")
 
+	var safe bool
+	flag.BoolVar(&safe, "safe", true, "run jekyll with the --safe flag")
+
 	flag.Parse()
 
 	repo := flag.Arg(0)
@@ -148,7 +151,12 @@ func main() {
 					panic(err)
 				}
 
-				cmd = exec.Command("jekyll", "build", "-s", repoDir, "-d", dir)
+				var safeFlag string
+				if safe {
+					safeFlag = "--safe"
+				}
+
+				cmd = exec.Command("jekyll", "build", safeFlag, "-s", repoDir, "-d", dir)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 
