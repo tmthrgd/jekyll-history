@@ -30,6 +30,9 @@ func main() {
 	var safe bool
 	flag.BoolVar(&safe, "safe", true, "run jekyll with the --safe flag")
 
+	var port int
+	flag.IntVar(&port, "port", 8080, "the port to listen on")
+
 	flag.Parse()
 
 	repo := flag.Arg(0)
@@ -237,8 +240,8 @@ func main() {
 		http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
 	})
 
-	fmt.Println("Listening on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	fmt.Printf("Listening on :%d\n", port)
+	if err := http.ListenAndServe(":"+strconv.Itoa(port), nil); err != nil {
 		panic(err)
 	}
 }
