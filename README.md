@@ -10,7 +10,7 @@ go get github.com/tmthrgd/jekyll-history && go install github.com/tmthrgd/jekyll
 
 ## Run:
 
-`jekyll-history [-timeout <duration>] <repository url>`
+`jekyll-history [-safe=false] [-port=<port>] <repository url>`
 
 ## License
 

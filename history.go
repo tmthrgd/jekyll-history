@@ -1,4 +1,4 @@
-// Copyright 2016 Tom Thorogood. All rights reserved.
+// Copyright 2018 Tom Thorogood. All rights reserved.
 // Use of this source code is governed by a
 // Modified BSD License license that can be found in
 // the LICENSE file.
@@ -8,25 +8,71 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
-	"html"
+	"hash/fnv"
+	"html/template"
+	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/lunixbochs/vtclean"
+	"github.com/tmthrgd/httphandlers"
+	"github.com/tmthrgd/httprouter"
 )
 
-func main() {
-	var timeout time.Duration
-	flag.DurationVar(&timeout, "timeout", 2*time.Minute, "how long to keep open the commit listeners before timing out")
+var indexTmpl = template.Must(template.New("index").Parse(`<!doctype html>
+<meta charset=utf-8>
+<title>{{.Title}}</title>
+<style>body{margin:40px auto;max-width:650px;line-height:1.6;font-size:18px;color:#444;padding:0 10px}h1,h2,h3{line-height:1.2}</style>
+<h1>{{.Title}}</h1>
+<p>{{len .Commits}} commits:</p>
+<ul>
+{{- range .OrderedCommits}}
+<li><a href="/commit/{{.}}/"><code>{{.}}</code> {{index $.Commits .}}</a></li>
+{{- end}}
+</ul>`))
 
+var error404 = `<!doctype html>
+<meta charset=utf-8>
+<title>404 Not Found</title>
+<style>body{margin:40px auto;max-width:650px;line-height:1.6;font-size:18px;color:#444;padding:0 10px}h1,h2,h3{line-height:1.2}</style>
+<h1>404 Not Found</h1>
+<p>The requested file was not found.</p>`
+
+var buildErrorTmpl = template.Must(template.New("error-build").Parse(`<!doctype html>
+<meta charset=utf-8>
+<title>Error building {{.Commit}}</title>
+<style>body{margin:40px auto;max-width:1200px;line-height:1.6;font-size:18px;color:#444;padding:0 10px}h1,h2,h3{line-height:1.2}pre{overflow:auto}</style>
+<p>Error building {{.Commit}}:</p>
+<pre>{{.Msg}}</pre>`))
+
+var (
+	favicon = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\b\x06\x00\x00\x00\x1f\xf3\xffa\x00\x00\x00\x16IDATx\xdacd\xa0\x100\x8e\x1a0j\xc0\xa8\x01\xc3\xc5\x00\x00&\x98\x00\x11\x9b\x92AZ\x00\x00\x00\x00IEND\xaeB`\x82"
+	robots  = "User-agent: *\nDisallow: /"
+)
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s: <git repo>\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+}
+
+func main() {
 	var safe bool
 	flag.BoolVar(&safe, "safe", true, "run jekyll with the --safe flag")
 
@@ -37,211 +83,300 @@ func main() {
 
 	repo := flag.Arg(0)
 
-	if flag.NArg() != 1 || len(repo) == 0 {
-		fmt.Printf("usage: %s <git repo>\n", os.Args[0])
+	if flag.NArg() != 1 || repo == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	var repoLock sync.Mutex
+	for _, name := range [...]string{"git", "jekyll"} {
+		if _, err := exec.LookPath(name); err != nil {
+			log.Fatal(err)
+		}
+	}
 
-	repoDir, err := ioutil.TempDir("", "git.")
+	repoDir, err := ioutil.TempDir("", "repo.")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	defer os.RemoveAll(repoDir)
 
 	outDir, err := ioutil.TempDir("", "site.")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	defer os.RemoveAll(outDir)
 
 	cmd := exec.Command("git", "clone", repo, repoDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	cmd = exec.Command("git", "log", "--oneline")
 	cmd.Dir = repoDir
 	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	cmd.Stdout, cmd.Stderr = &out, os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	var order []string
+	var orderedCommits []string
 	commits := make(map[string]string)
 
 	scanner := bufio.NewScanner(&out)
 
 	for scanner.Scan() {
 		line := strings.SplitN(scanner.Text(), " ", 2)
-		commit := line[0]
-		title := line[1]
+		commit, title := line[0], line[1]
 
-		order = append(order, commit)
+		orderedCommits = append(orderedCommits, commit)
 		commits[commit] = title
 	}
 
 	if err := scanner.Err(); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "<!DOCTYPE html>\n<title>%s</title>\n<p>%d commits:</p>\n<ul>\n", html.EscapeString(repo), len(commits))
+	notFoundHandler := handlers.ServeError(http.StatusNotFound, []byte(error404), "text/html; charset=utf-8")
 
-		for _, commit := range order {
-			title := commits[commit]
-			fmt.Fprintf(w, "<li><a href=\"/commit/%[1]s\"><code>%[1]s</code> %[2]s</a></li>\n", commit, html.EscapeString(title))
-		}
+	hosts := &handlers.SafeHostSwitch{
+		NotFound: notFoundHandler,
+	}
 
-		fmt.Fprint(w, "</ul>")
+	router := httprouter.New()
+	router.NotFound = notFoundHandler
+	hosts.Add("127.0.0.1", router)
+
+	now := time.Now()
+
+	index, err := handlers.ServeTemplate("index.html", now, indexTmpl, struct {
+		Title          string
+		OrderedCommits []string
+		Commits        map[string]string
+	}{
+		Title:          repo,
+		OrderedCommits: orderedCommits,
+		Commits:        commits,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	done := make(map[string]struct{}, len(commits))
-	var doneLock sync.RWMutex
-
-	ports := make(map[string]string, len(commits))
-	var portsLock sync.RWMutex
-
-	http.HandleFunc("/commit/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.SplitN(r.URL.Path[len("/commit/"):], "/", 2)
-		commit := parts[0]
-		var redirect string
-
-		if len(parts) == 2 {
-			redirect = parts[1]
-		}
-
-		if _, ok := commits[commit]; !ok {
-			http.NotFound(w, r)
-			return
-		}
-
-		defer func() {
-			if err := recover(); err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-				fmt.Printf("error: %v\n", err)
-			}
-		}()
-
-		dir := path.Join(outDir, commit)
-
-		doneLock.RLock()
-		if _, ok := done[commit]; !ok {
-			doneLock.RUnlock()
-
-			repoLock.Lock()
-			doneLock.Lock()
-			if _, ok := done[commit]; !ok {
-				cmd := exec.Command("git", "checkout", commit)
-				cmd.Dir = repoDir
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-
-				if err := cmd.Run(); err != nil {
-					doneLock.Unlock()
-					repoLock.Unlock()
-
-					panic(err)
-				}
-
-				var safeFlag string
-				if safe {
-					safeFlag = "--safe"
-				}
-
-				cmd = exec.Command("jekyll", "build", safeFlag, "-s", repoDir, "-d", dir)
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-
-				if err := cmd.Run(); err != nil {
-					doneLock.Unlock()
-					repoLock.Unlock()
-
-					panic(err)
-				}
-
-				done[commit] = struct{}{}
-			}
-			doneLock.Unlock()
-			repoLock.Unlock()
-		} else {
-			doneLock.RUnlock()
-		}
-
-		portsLock.RLock()
-		if port, ok := ports[commit]; ok {
-			http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
-
-			portsLock.RUnlock()
-			return
-		} else {
-			portsLock.RUnlock()
-		}
-
-		portsLock.Lock()
-		if port, ok := ports[commit]; ok {
-			http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
-
-			portsLock.Unlock()
-			return
-		}
-
-		ln, err := net.Listen("tcp", ":0")
-		if err != nil {
-			portsLock.Unlock()
-
-			panic(err)
-		}
-
-		port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
-		ports[commit] = port
-
-		go func() {
-			timer := time.AfterFunc(timeout, func() {
-				fmt.Printf("%s listener timed out at :%s after %s of inactivity\n", commit, port, timeout)
-
-				portsLock.Lock()
-				delete(ports, commit)
-				portsLock.Unlock()
-
-				if err := ln.Close(); err != nil {
-					panic(err)
-				}
-			})
-
-			handler := http.FileServer(http.Dir(dir))
-			server := &http.Server{
-				Addr: ":" + port,
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					timer.Reset(timeout)
-					handler.ServeHTTP(w, r)
-				}),
-			}
-
-			fmt.Printf("Listening for %s on :%s\n", commit, port)
-
-			err := server.Serve(tcpKeepAliveListener{ln.(*net.TCPListener)})
-			if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-				panic(err)
-			}
-		}()
-		portsLock.Unlock()
-
-		http.Redirect(w, r, "http://localhost:"+port+"/"+redirect, http.StatusSeeOther)
+	router.GetAndHead("/", index)
+	router.GetAndHead("/commit/:commit/*path", &commitHandler{
+		safe:     safe,
+		port:     port,
+		repoDir:  repoDir,
+		outDir:   outDir,
+		commits:  commits,
+		hosts:    hosts,
+		notFound: notFoundHandler,
 	})
+	router.GetAndHead("/favicon.ico", handlers.ServeString("favicon.png", now, favicon))
+	router.GetAndHead("/robots.txt", handlers.ServeString("robots.txt", now, robots))
+
+	handler := handlers.AccessLog(hosts, nil)
+	handler = &handlers.SecurityHeaders{
+		Handler: handler,
+	}
+	handler = handlers.SetHeader(handler, "Server", "jekyll-history")
 
 	fmt.Printf("Listening on :%d\n", port)
-	if err := http.ListenAndServe(":"+strconv.Itoa(port), nil); err != nil {
-		panic(err)
+
+	srv := &http.Server{
+		Addr:    ":" + strconv.Itoa(port),
+		Handler: handler,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// termination handler
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+	<-term
+
+	// gracefull shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("error shutting down: %v", err)
 	}
 }
+
+type commitHandler struct {
+	safe     bool
+	port     int
+	repoDir  string
+	outDir   string
+	commits  map[string]string
+	hosts    *handlers.SafeHostSwitch
+	notFound http.Handler
+
+	build    sync.Map
+	repoLock sync.Mutex
+}
+
+func (ch *commitHandler) buildSite(commit, dir string) error {
+	var stderr bytes.Buffer
+	stderrClean := vtclean.NewWriter(&stderr, false)
+	stderrWriter := io.MultiWriter(os.Stderr, stderrClean)
+
+	ch.repoLock.Lock()
+	defer ch.repoLock.Unlock()
+
+	cmd := exec.Command("git", "checkout", commit)
+	cmd.Dir = ch.repoDir
+	cmd.Stdout, cmd.Stderr = os.Stdout, stderrWriter
+
+	if err := cmd.Run(); err != nil {
+		stderrClean.Close()
+		return &stderrError{err, stderr.Bytes()}
+	}
+
+	stderr.Reset()
+
+	var safeFlag string
+	if ch.safe {
+		safeFlag = "--safe"
+	}
+
+	cmd = exec.Command("jekyll", "build", safeFlag, "-s", ch.repoDir, "-d", dir)
+	cmd.Dir = ch.repoDir
+	cmd.Stdout, cmd.Stderr = os.Stdout, stderrWriter
+
+	if err := cmd.Run(); err != nil {
+		stderrClean.Close()
+		return &stderrError{err, stderr.Bytes()}
+	}
+
+	return nil
+}
+
+func (ch *commitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	params := httprouter.GetParams(r.Context())
+	commit, redirect := params.ByName("commit"), params.ByName("path")
+
+	if _, ok := ch.commits[commit]; !ok {
+		ch.notFound.ServeHTTP(w, r)
+		return
+	}
+
+	v, ok := ch.build.Load(commit)
+	if !ok {
+		v, _ = ch.build.LoadOrStore(commit, new(buildCommitOnce))
+	}
+
+	host, err := v.(*buildCommitOnce).Do(ch, commit)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+
+		buildErrorTmpl.Execute(w, struct {
+			Commit, Msg string
+		}{
+			Commit: commit,
+			Msg:    err.Error(),
+		})
+
+		if se, ok := err.(*stderrError); ok {
+			err = se.err
+		}
+
+		log.Printf("Error serving %s: %s", commit, err)
+		return
+	}
+
+	url := &url.URL{
+		Scheme:   "http",
+		Host:     net.JoinHostPort(host, strconv.Itoa(ch.port)),
+		Path:     redirect,
+		RawQuery: r.URL.RawQuery,
+	}
+	http.Redirect(w, r, url.String(), http.StatusSeeOther)
+}
+
+type buildCommitOnce struct {
+	once sync.Once
+	host string
+	err  error
+}
+
+func (bc *buildCommitOnce) Do(ch *commitHandler, commit string) (string, error) {
+	bc.once.Do(func() {
+		dir := path.Join(ch.outDir, commit)
+
+		if bc.err = ch.buildSite(commit, dir); bc.err != nil {
+			return
+		}
+
+		handler := siteHandler(dir)
+
+		var (
+			ip   [net.IPv4len]byte
+			zero [1]byte
+		)
+
+		h := fnv.New32a()
+		io.WriteString(h, commit)
+
+		for {
+			h.Sum(ip[:0])
+			ip[0] = 127
+
+			bc.host = net.IP(ip[:]).String()
+
+			if ch.hosts.Add(bc.host, handler) == nil {
+				break
+			}
+
+			h.Write(zero[:])
+		}
+	})
+
+	return bc.host, bc.err
+}
+
+func siteHandler(dir string) http.Handler {
+	notFound := handlers.ErrorCode(http.StatusNotFound)
+
+	if f, err := http.Dir(dir).Open("/404.html"); err == nil {
+		defer f.Close()
+
+		if content, err := ioutil.ReadAll(f); err == nil {
+			notFound = handlers.ServeError(http.StatusNotFound, content, "text/html; charset=utf-8")
+		}
+	}
+
+	handler := http.FileServer(http.Dir(dir))
+	return handlers.StatusCodeSwitch(handler, map[int]http.Handler{
+		http.StatusNotFound: notFound,
+	})
+}
+
+type stderrError struct {
+	err    error
+	stderr []byte
+}
+
+func (e *stderrError) Error() string {
+	if len(e.stderr) == 0 {
+		return e.err.Error()
+	}
+
+	stderr := bytes.Replace(e.stderr, nl, nltb, -1)
+	stderr = bytes.TrimRight(stderr, "\t")
+	return fmt.Sprintf("%s:\n\t%s", e.err, stderr)
+}
+
+var (
+	nl   = []byte{'\n'}
+	nltb = []byte{'\n', '\t'}
+)
