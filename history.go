@@ -153,6 +153,8 @@ func main() {
 	router.NotFound(notFoundHandler.ServeHTTP)
 
 	hosts.Add("127.0.0.1", router)
+	hosts.Add("::1", router)
+	hosts.Add("localhost", router)
 
 	now := time.Now()
 
