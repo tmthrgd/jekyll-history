@@ -29,9 +29,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
 	"github.com/lunixbochs/vtclean"
 	"github.com/tmthrgd/httphandlers"
-	"github.com/tmthrgd/httprouter"
 )
 
 var indexTmpl = template.Must(template.New("index").Parse(`<!doctype html>
@@ -147,8 +148,10 @@ func main() {
 		NotFound: notFoundHandler,
 	}
 
-	router := httprouter.New()
-	router.NotFound = notFoundHandler
+	router := chi.NewRouter()
+	router.Use(middleware.GetHead)
+	router.NotFound(notFoundHandler.ServeHTTP)
+
 	hosts.Add("127.0.0.1", router)
 
 	now := time.Now()
@@ -166,8 +169,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	router.GetAndHead("/", index)
-	router.GetAndHead("/commit/:commit/*path", &commitHandler{
+	router.Get("/", index.ServeHTTP)
+	router.Get("/commit/{commit}/*", (&commitHandler{
 		safe:     safe,
 		port:     port,
 		repoDir:  repoDir,
@@ -175,9 +178,9 @@ func main() {
 		commits:  commits,
 		hosts:    hosts,
 		notFound: notFoundHandler,
-	})
-	router.GetAndHead("/favicon.ico", handlers.ServeString("favicon.png", now, favicon))
-	router.GetAndHead("/robots.txt", handlers.ServeString("robots.txt", now, robots))
+	}).ServeHTTP)
+	router.Get("/favicon.ico", handlers.ServeString("favicon.png", now, favicon).ServeHTTP)
+	router.Get("/robots.txt", handlers.ServeString("robots.txt", now, robots).ServeHTTP)
 
 	handler := handlers.AccessLog(hosts, nil)
 	handler = &handlers.SecurityHeaders{
@@ -262,8 +265,8 @@ func (ch *commitHandler) buildSite(commit, dir string) error {
 }
 
 func (ch *commitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	params := httprouter.GetParams(r.Context())
-	commit, redirect := params.ByName("commit"), params.ByName("path")
+	params := chi.RouteContext(r.Context())
+	commit, redirect := params.URLParam("commit"), params.URLParam("*")
 
 	if _, ok := ch.commits[commit]; !ok {
 		ch.notFound.ServeHTTP(w, r)
