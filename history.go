@@ -324,10 +324,8 @@ func (bc *buildCommitOnce) Do(ch *commitHandler, commit string) (string, error) 
 
 		handler := siteHandler(dir)
 
-		var (
-			ip   [net.IPv4len]byte
-			zero [1]byte
-		)
+		var ip [net.IPv4len]byte
+		one := [1]byte{1}
 
 		h := fnv.New32a()
 		io.WriteString(h, commit)
@@ -342,7 +340,7 @@ func (bc *buildCommitOnce) Do(ch *commitHandler, commit string) (string, error) 
 				break
 			}
 
-			h.Write(zero[:])
+			h.Write(one[:])
 		}
 	})
 
