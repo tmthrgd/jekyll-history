@@ -322,7 +322,7 @@ func (bc *buildCommitOnce) Do(ch *commitHandler, commit string) (string, error) 
 			return
 		}
 
-		handler := siteHandler(dir)
+		handler := http.FileServer(httpDir(dir))
 
 		var ip [net.IPv4len]byte
 		one := [1]byte{1}
@@ -347,21 +347,22 @@ func (bc *buildCommitOnce) Do(ch *commitHandler, commit string) (string, error) 
 	return bc.host, bc.err
 }
 
-func siteHandler(dir string) http.Handler {
-	notFound := handlers.ErrorCode(http.StatusNotFound)
+type httpDir string
 
-	if f, err := http.Dir(dir).Open("/404.html"); err == nil {
-		defer f.Close()
+func (d httpDir) Open(name string) (http.File, error) {
+	dir := http.Dir(d)
 
-		if content, err := ioutil.ReadAll(f); err == nil {
-			notFound = handlers.ServeError(http.StatusNotFound, content, "text/html; charset=utf-8")
-		}
+	f, err := dir.Open(name)
+	if !os.IsNotExist(err) {
+		return f, err
 	}
 
-	handler := http.FileServer(http.Dir(dir))
-	return handlers.StatusCodeSwitch(handler, map[int]http.Handler{
-		http.StatusNotFound: notFound,
-	})
+	f404, err := dir.Open("/404.html")
+	if err == nil {
+		return f404, nil
+	}
+
+	return f, err
 }
 
 type stderrError struct {
