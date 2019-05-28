@@ -5,7 +5,7 @@ jekyll-history clones a git repository and runs `jekyll build` at any commit in 
 ## Download:
 
 ```
-go get github.com/tmthrgd/jekyll-history && go install github.com/tmthrgd/jekyll-history
+go get tmthrgd.dev/go/jekyll-history
 ```
 
 ## Run:
