@@ -1,4 +1,4 @@
-module tmthrgd.dev/go/jekyll-history
+module go.tmthrgd.dev/jekyll-history
 
 go 1.12
 
